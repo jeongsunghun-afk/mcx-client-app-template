@@ -6,10 +6,23 @@
 """
 CSP(Cyclic Synchronous Position) 모드 - hostInJointAdditivePosition1 직접 제어
 
-흐름:
-  Python → MachineControl/hostInJointAdditivePosition1
-         → MachineControl/jointPositionsTarget
-         → actuatorControlLoop01 → 드라이브
+읽기 흐름 (현재 위치 파악):
+  EtherCAT (0x6064)
+        ↓  [master.xml 링크]
+  motorPositionActual  (raw enc counts)  ← ACTUAL_PATH로 직접 읽음
+        ↓  [ENC_TO_RAD: counts → rad]    ← Python에서 수동 변환
+  현재 위치 (rad)
+
+쓰기 흐름 (목표 위치 전송):
+  Python → hostInJointAdditivePosition1  ← CSP_PATH에 additive offset(rad) 전송
+        ↓  [Motorcortex 내부 연결]
+  MachineControl/jointPositionsTarget
+        ↓  [Motorcortex 내부 연결]
+  actuatorControlLoop01
+        ↓  [positionTransformation: rad → counts]
+  motorPositionTarget  (raw enc counts)
+        ↓  [master.xml 링크]
+  EtherCAT (0x607A)
 
 특징:
   - 현재 위치를 기준으로 오프셋(additive)을 매 주기 전송
@@ -25,8 +38,9 @@ logging.basicConfig(level=logging.INFO)
 from src.mcx_client_app import McxClientApp, McxClientAppConfiguration
 
 # ── 설정 상수 ──────────────────────────────────────────────────────────────────
-# CSP 위치 오프셋 경로 (현재 위치에 더해지는 additive position)
+# [쓰기] additive offset(rad) → jointPositionsTarget → actuatorControlLoop → EtherCAT(0x607A)
 CSP_PATH    = "root/MachineControl/hostInJointAdditivePosition1"
+# [읽기] EtherCAT(0x6064) → motorPositionActual(raw enc counts) → Python에서 rad 변환
 ACTUAL_PATH = "root/AxesControl/actuatorControlLoops/actuatorControlLoop01/motorPositionActual"
 
 # 상태머신
@@ -36,7 +50,7 @@ ENGAGE_CMD      = 2       # GOTO_ENGAGED_E
 ENGAGED_STATE   = 4       # ENGAGED_S
 ENGAGE_TIMEOUT  = 10.0
 
-# 엔코더
+# 엔코더 변환 (motorPositionActual: raw counts → rad, Motorcortex 내부 변환 미사용)
 ENC_INC_PER_REV = 4096
 ENC_TO_RAD      = (2.0 * math.pi) / ENC_INC_PER_REV
 
@@ -98,10 +112,12 @@ class CspClientAppV3(McxClientApp):
     def _homing(self) -> bool:
         """현재 위치를 읽어 0이 아니면 선형 램프로 0으로 복귀."""
         try:
+            # [읽기] EtherCAT(0x6064) → motorPositionActual(raw counts)
             actual = self.req.getParameter(ACTUAL_PATH).get()
             if not actual or not actual.value:
                 logging.warning("위치 읽기 실패, 홈 생략.")
                 return True
+            # raw counts → rad (Python에서 직접 변환, Motorcortex positionTransformation 미사용)
             current_rad = float(actual.value[0]) * ENC_TO_RAD
         except Exception as e:
             logging.warning(f"위치 읽기 오류: {e}, 홈 생략.")
@@ -180,6 +196,8 @@ class CspClientAppV3(McxClientApp):
         offset_rad = self.home_offset + AMPLITUDE_RAD * math.sin(2.0 * math.pi * FREQUENCY_HZ * t)
         # ─────────────────────────────────────────────────────────────────────
 
+        # [쓰기] offset_rad → hostInJointAdditivePosition1 → jointPositionsTarget
+        #         → actuatorControlLoop → motorPositionTarget(counts) → EtherCAT(0x607A)
         self.req.setParameter(CSP_PATH, [offset_rad])
 
         time.sleep(CYCLE_TIME)
