@@ -41,10 +41,20 @@ from src.mcx_client_app import McxClientApp, McxClientAppConfiguration
 # ── 설정 상수 ──────────────────────────────────────────────────────────────────
 NUM_AXES = 4
 
+# 실제 모터 / 시뮬레이션 축 구분 (True = 실제 EtherCAT 연결, False = 시뮬레이션)
+# 축1: 실제 모터,  축2~4: 시뮬레이션 (드라이브 미연결)
+AXIS_IS_REAL = [True, False, False, False]
+
+# [드라이브 비활성화] 시뮬레이션 축의 드라이브 출력 차단
+# setParameter(DISABLE_DRIVE_PATH, [False, True, True, True])
+# → 축1 활성, 축2~4 비활성
+DISABLE_DRIVE_PATH = "root/DriveLogic/disableDrive"
+
 # [쓰기] 4-element additive offset list(rad) → jointPositionsTarget → actuatorControlLoop01~04 → EtherCAT(0x607A)
 CSP_PATH     = "root/MachineControl/hostInJointAdditivePosition1"
 
 # [읽기] EtherCAT(0x6064) × 4 → motorPositionActual(raw enc counts) → Python에서 rad 변환
+# 시뮬레이션 축(AXIS_IS_REAL=False)은 homing 시 읽기 생략, home_offset=0 고정
 ACTUAL_PATHS = [
     f"root/AxesControl/actuatorControlLoops/actuatorControlLoop0{i}/motorPositionActual"
     for i in range(1, NUM_AXES + 1)
@@ -132,40 +142,52 @@ class CspClientAppV4(McxClientApp):
     def _homing(self) -> bool:
         """4축 actual을 매 스텝 읽어 모든 축이 0° threshold 이내가 될 때까지 동시 조정."""
 
-        # 4축 초기 위치 읽기
+        # 축별 초기 위치 읽기 (시뮬레이션 축은 0.0으로 고정)
         currents: list[float] = []
         for i in range(NUM_AXES):
+            if not AXIS_IS_REAL[i]:
+                # 시뮬레이션 축: 실제 EtherCAT 없음 → 읽기 생략, 0°로 간주
+                currents.append(0.0)
+                logging.info(f"축{i+1} [시뮬] Homing 생략, home_offset=0°")
+                continue
             val = self._read_actual(i)
             if val is None:
                 logging.warning(f"축{i+1} 위치 읽기 실패, Homing 생략.")
                 return True
             currents.append(val)
-            logging.info(f"축{i+1} 현재 위치: {math.degrees(val):.2f}°")
+            logging.info(f"축{i+1} [실제] 현재 위치: {math.degrees(val):.2f}°")
 
-        # 전 축이 이미 홈 이내인지 확인
-        if all(abs(c) <= HOMING_THRESHOLD_RAD for c in currents):
-            logging.info("전 축 홈 위치 이내, Homing 생략.")
-            # [쓰기] 4축 동시 0 전송
+        # 실제 축 중 홈 이내인지 확인
+        real_done = all(
+            abs(currents[i]) <= HOMING_THRESHOLD_RAD
+            for i in range(NUM_AXES) if AXIS_IS_REAL[i]
+        )
+        if real_done:
+            logging.info("실제 축 전체 홈 위치 이내, Homing 생략.")
             self.req.setParameter(CSP_PATH, [0.0] * NUM_AXES).get()
             self.home_offsets = [0.0] * NUM_AXES
             return True
 
-        logging.info(f"4축 동시 Homing 시작 ({HOMING_VEL_DEG_S}°/s)")
+        logging.info(f"실제 축 Homing 시작 ({HOMING_VEL_DEG_S}°/s), 시뮬 축은 0 유지")
 
-        # [클로즈드루프] 4축 동시: 모든 축이 threshold 이내가 될 때까지 반복
+        # [클로즈드루프] 실제 축만 homing, 시뮬 축은 offset=0 고정
         offsets: list[float] = [0.0] * NUM_AXES
         while True:
-            # 종료 조건: 전 축 threshold 이내
-            if all(abs(currents[i]) <= HOMING_THRESHOLD_RAD for i in range(NUM_AXES)):
+            # 종료 조건: 실제 축 전부 threshold 이내
+            if all(
+                abs(currents[i]) <= HOMING_THRESHOLD_RAD
+                for i in range(NUM_AXES) if AXIS_IS_REAL[i]
+            ):
                 break
 
-            # 각 축 step 계산 (이미 홈인 축은 현재 offset 유지)
             for i in range(NUM_AXES):
+                if not AXIS_IS_REAL[i]:
+                    continue   # 시뮬 축: offset 변경 없음
                 if abs(currents[i]) > HOMING_THRESHOLD_RAD:
                     step = math.copysign(HOMING_VEL_RAD_S * CYCLE_TIME, -currents[i])
                     offsets[i] += step
 
-            # [쓰기] 4축을 하나의 setParameter 호출로 동시 전송
+            # [쓰기] 4축 동시 전송 (시뮬 축 offset=0 포함)
             try:
                 self.req.setParameter(CSP_PATH, offsets).get()
             except Exception as e:
@@ -174,8 +196,10 @@ class CspClientAppV4(McxClientApp):
 
             time.sleep(CYCLE_TIME)
 
-            # 4축 actual 갱신 (클로즈드루프)
+            # 실제 축만 actual 갱신 (클로즈드루프)
             for i in range(NUM_AXES):
+                if not AXIS_IS_REAL[i]:
+                    continue
                 val = self._read_actual(i)
                 if val is not None:
                     currents[i] = val
@@ -202,6 +226,16 @@ class CspClientAppV4(McxClientApp):
             logging.info("JogMode / PauseMode 해제 완료.")
         except Exception as e:
             logging.warning(f"모드 해제 실패: {e}")
+
+        # ── 시뮬레이션 축 드라이브 비활성화 ────────────────────────────────────
+        # AXIS_IS_REAL 기반: 실제 축=False(활성), 시뮬 축=True(비활성)
+        disable_mask = [not real for real in AXIS_IS_REAL]
+        sim_axes = [i+1 for i, real in enumerate(AXIS_IS_REAL) if not real]
+        try:
+            self.req.setParameter(DISABLE_DRIVE_PATH, disable_mask).get()
+            logging.info(f"드라이브 비활성화 완료 — 시뮬레이션 축: {sim_axes}")
+        except Exception as e:
+            logging.warning(f"드라이브 비활성화 실패: {e}")
 
         if not self._homing():
             logging.error("Homing 실패, CSP 제어 중단.")
