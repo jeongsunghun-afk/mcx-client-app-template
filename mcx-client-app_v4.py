@@ -32,6 +32,8 @@ CSP(Cyclic Synchronous Position) 모드 - hostInJointAdditivePosition1 4축 동�
 """
 
 import logging
+import signal
+import sys
 import time
 import math
 logging.basicConfig(level=logging.INFO)
@@ -217,6 +219,9 @@ class CspClientAppV4(McxClientApp):
 
     # ── 초기화 ────────────────────────────────────────────────────────────────
     def startOp(self) -> None:
+        # 1kHz 루프에서 watchdog .get() 블로킹 호출이 Ctrl+C 신호 처리를 막으므로 비활성화
+        self.watchdog.setEnable(False)
+
         if not self._engage():
             return
 
@@ -268,7 +273,11 @@ class CspClientAppV4(McxClientApp):
         # home_offsets[i] 기준 ±AMPLITUDE 사인파 (축별 독립 home 유지)
         # ※ 여기서 원하는 궤적으로 교체하세요 (axes별 다른 amplitude/phase 등)
         sin_val = AMPLITUDE_RAD * math.sin(2.0 * math.pi * FREQUENCY_HZ * t)
-        offsets = [self.home_offsets[i] + sin_val for i in range(NUM_AXES)]
+        # 실제 축(AXIS_IS_REAL=True)만 궤적 적용, 시뮬 축은 0 오프셋 유지
+        offsets = [
+            self.home_offsets[i] + (sin_val if AXIS_IS_REAL[i] else 0.0)
+            for i in range(NUM_AXES)
+        ]
         # ───────────────────────────────────────────────────────────────────────
 
         # [쓰기] [r0, r1, r2, r3] → hostInJointAdditivePosition1 (4축 동시, 단일 호출)
@@ -298,4 +307,12 @@ if __name__ == "__main__":
     print(f"\nUsing configuration: {client_options}\n\n")
 
     app = CspClientAppV4(client_options)
+
+    def _sigint_handler(sig, frame):
+        logging.info("Ctrl+C 감지 — 앱 종료 중...")
+        app.running.set(False)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     app.run()
